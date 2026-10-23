@@ -1,395 +1,192 @@
-
-import { useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { loadDashboard, request, type DashboardLoadState } from './api'
+import CircleHeadDashboard from './CircleHeadDashboard'
+import { normalizeInstallmentAmount, validateInstallmentAmount } from './managementValidation'
+import { businessPeriod, dateLabel, formatBusinessDate, parseStoredTimestamp } from './businessDate'
 
 type Section = 'Overview' | 'My Circles' | 'Contributions' | 'Reliability'
-
-type Transaction = {
-  id: number
-  circle: string
-  amount: number
-  date: string
-  status: 'Completed' | 'Demo recorded'
-}
-
-const initialTransactions: Transaction[] = [
-  { id: 1, circle: "Women's Growth Circle", amount: 2000, date: 'Oct 12, 2026', status: 'Completed' },
-  { id: 2, circle: 'Community Savers', amount: 2000, date: 'Sep 12, 2026', status: 'Completed' },
-  { id: 3, circle: "Women's Growth Circle", amount: 2000, date: 'Sep 05, 2026', status: 'Completed' },
-  { id: 4, circle: 'Community Savers', amount: 2000, date: 'Aug 12, 2026', status: 'Completed' },
-]
-
-const circles = [
-  { name: "Women's Growth Circle", members: 10, contribution: 2000, progress: 70, color: 'bg-emerald-100 text-emerald-700', initials: 'WG', due: 'Oct 25, 2026' },
-  { name: 'Community Savers', members: 8, contribution: 1500, progress: 55, color: 'bg-violet-100 text-violet-700', initials: 'CS', due: 'Oct 28, 2026' },
-]
-
-const money = (amount: number) =>
-  '₹' + amount.toLocaleString('en-IN')
-
+type Factor = { key: string; label: string; value: number; weight: number; points: number; detail: string }
+type Score = { score: number; maxScore: number; factors: Factor[]; calculatedAt: string; disclaimer: string }
+type Circle = { id: string; name: string; contribution_amount: number; frequency: 'monthly' | 'weekly'; due_day: number; members: number; membership_id: string; paid_count: number; status:'open'|'frozen' }
+type Contribution = { id: string; payment_id?: string | null; circle_name: string; amount: number; due_date: string; paid_at: string | null; status: 'pending' | 'successful' | 'failed' | 'delayed'; created_at: string }
+type Obligation = { round_member_id: string; membership_id: string; target_amount: number; deadline: string; paid: number; status: string; timingStatus: string; remainingAmount: number; hasPending: boolean; hasFailed: boolean }
+type Dashboard = { user: { id: string; name: string; email: string }; circles: Circle[]; contributions: Contribution[]; scoreByMembership: Record<string, Score>; obligations: Obligation[]; businessDate: string; businessTimeZone: string }
+type AuthUser = { id: string; name: string; email: string; role: 'member' | 'circle_head' }
+const money = (amount: number) => `₹${amount.toLocaleString('en-IN')}`
+const formatDate = formatBusinessDate
 function App() {
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null)
+  const [authLoading, setAuthLoading] = useState(true)
+  const [authError, setAuthError] = useState('')
+  const [loginEmail, setLoginEmail] = useState('')
+  const [loginPassword, setLoginPassword] = useState('')
+  const [showRegistration,setShowRegistration]=useState(false)
+  const [loginBusy, setLoginBusy] = useState(false)
   const [section, setSection] = useState<Section>('Overview')
-  const [saved, setSaved] = useState(8000)
-  const [transactions, setTransactions] = useState(initialTransactions)
+  const [dashboard, setDashboard] = useState<Dashboard | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [busyCircle, setBusyCircle] = useState('')
+  const [contributionErrors, setContributionErrors] = useState<Record<string, string>>({})
   const [notice, setNotice] = useState('')
-  const [showProfile, setShowProfile] = useState(false)
+  const [error, setError] = useState('')
 
-  function recordContribution(circleName: string, amount: number) {
-    const transaction: Transaction = {
-      id: Date.now(),
-      circle: circleName,
-      amount,
-      date: 'Today',
-      status: 'Demo recorded',
+  const refresh = useCallback(async () => {
+    setError('')
+    await loadDashboard(() => request<Dashboard>('/dashboard'), (state: DashboardLoadState<Dashboard>) => {
+      setLoading(state.status === 'loading')
+      if (state.status === 'ready') { setDashboard(state.value); setError('') }
+      if (state.status === 'error') setError(state.message)
+    })
+  }, [])
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void request<{user:AuthUser}>('/auth/me').then(result => { setAuthUser(result.user); setAuthError('') })
+        .catch(cause => { setAuthUser(null); if (cause instanceof Error && !cause.message.includes('Sign in')) setAuthError(cause.message) })
+        .finally(() => setAuthLoading(false))
+    }, 0)
+    return () => window.clearTimeout(timer)
+  }, [])
+  useEffect(() => {
+    if (authUser?.role !== 'member') return
+    const timer = window.setTimeout(() => { void refresh() }, 0)
+    return () => window.clearTimeout(timer)
+  }, [authUser, refresh])
+  useEffect(() => {
+    if (authUser?.role !== 'member') return
+    const timer = window.setInterval(() => { void refresh() }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [authUser, refresh])
+
+  const score = useMemo(() => {
+    if (!dashboard || !dashboard.contributions.length) return null
+    const scores = Object.values(dashboard.scoreByMembership)
+    if (!scores.length) return null
+    return Math.round(scores.reduce((sum, value) => sum + value.score, 0) / scores.length)
+  }, [dashboard])
+
+  async function recordContribution(circle: Circle, amountInput: unknown) {
+    if (!dashboard) return
+    const obligation = dashboard.obligations?.find(item => item.membership_id === circle.membership_id)
+    if (!obligation) { setContributionErrors(current => ({...current,[circle.id]:'You are not included in this month’s locked round. Your membership is eligible for a future round.'})); return }
+    const remaining = Math.max(0, obligation.target_amount - obligation.paid)
+    const validation=validateInstallmentAmount(amountInput,remaining)
+    if (validation) { setContributionErrors(current => ({...current,[circle.id]:validation})); return }
+    const paymentAmount = normalizeInstallmentAmount(amountInput)!
+    setContributionErrors(current => { const next={...current};delete next[circle.id];return next })
+    setBusyCircle(circle.id); setNotice(''); setError('')
+    try {
+      const dueDate = obligation.deadline
+      const payment = await request<{ payment: { id: string }; simulated: boolean }>('/payments', {
+        method: 'POST', body: JSON.stringify({ membershipId: circle.membership_id, amount: paymentAmount, dueDate, roundMemberId: obligation.round_member_id, idempotencyKey: crypto.randomUUID() }),
+      })
+      const settled = await request<{ payment: { status: string }; simulated: boolean }>(`/payments/${payment.payment.id}/settle`, { method: 'POST' })
+      await refresh()
+      setNotice(settled.payment.status === 'successful'
+        ? `${money(paymentAmount)} simulated installment recorded. No real money was transferred.`
+        : 'The simulated payment failed. You can retry the contribution.')
+      setSection('Contributions')
+    } catch (cause) { setContributionErrors(current => ({...current,[circle.id]:cause instanceof Error ? cause.message : 'Payment could not be recorded.'})) }
+    finally { setBusyCircle('') }
+  }
+
+  async function retryContribution(item: Contribution) {
+    const circle = dashboard?.circles.find(value => value.name === item.circle_name)
+    if (!circle) return
+    if (item.status !== 'pending' || !item.payment_id) {
+      const obligation=dashboard?.obligations?.find(value=>value.membership_id===circle.membership_id)
+      return obligation ? recordContribution(circle,Math.max(0,obligation.target_amount-obligation.paid)) : undefined
     }
-
-    setTransactions(previous => [transaction, ...previous])
-    setSaved(previous => previous + amount)
-    setNotice(`${money(amount)} demo contribution recorded successfully. No real money was transferred.`)
-    setSection('Contributions')
+    setBusyCircle(circle.id); setNotice(''); setError('')
+    try {
+      const settled = await request<{ payment: { status: string } }>(`/payments/${item.payment_id}/settle`, { method: 'POST' })
+      await refresh()
+      setNotice(settled.payment.status === 'successful' ? 'Simulated contribution confirmed. No real money was transferred.' : 'The simulated payment failed. You can retry it from this history.')
+    } catch (cause) { setError(cause instanceof Error ? cause.message : 'Payment could not be resumed.') }
+    finally { setBusyCircle('') }
   }
 
   const navItems: { label: Section; icon: string }[] = [
-    { label: 'Overview', icon: '⌂' },
-    { label: 'My Circles', icon: '◉' },
-    { label: 'Contributions', icon: '↗' },
-    { label: 'Reliability', icon: '◇' },
+    { label: 'Overview', icon: '⌂' }, { label: 'My Circles', icon: '◉' },
+    { label: 'Contributions', icon: '↗' }, { label: 'Reliability', icon: '◇' },
   ]
+  const totalSaved = dashboard?.contributions.filter(item => item.status === 'successful').reduce((sum, item) => sum + item.amount, 0) ?? 0
+  const thisMonth = dashboard?.contributions.filter(item => item.status === 'successful' && item.paid_at && businessPeriod(parseStoredTimestamp(item.paid_at)) === businessPeriod()).reduce((sum, item) => sum + item.amount, 0) ?? 0
+  const obligationSummary = dashboard?.obligations.reduce((summary, obligation) => { summary[obligation.timingStatus] = (summary[obligation.timingStatus] ?? 0) + 1; if (obligation.status === 'partially_paid') summary.partially_paid = (summary.partially_paid ?? 0) + 1; return summary }, {} as Record<string, number>) ?? {}
+  const outstanding = dashboard?.obligations.reduce((sum, obligation) => sum + obligation.remainingAmount, 0) ?? 0
+  const statusLabel = (status: Contribution['status']) => status === 'successful' ? 'Successful · Simulated' : status[0].toUpperCase() + status.slice(1)
+
+  async function signIn(event: React.FormEvent) {
+    event.preventDefault();setLoginBusy(true);setAuthError('')
+    try { const result=await request<{user:AuthUser}>('/auth/login',{method:'POST',body:JSON.stringify({email:loginEmail,password:loginPassword})});setAuthUser(result.user);setDashboard(null);setLoading(true) }
+    catch(cause){setAuthError(cause instanceof Error?cause.message:'Sign in failed.')}
+    finally{setLoginBusy(false)}
+  }
+
+  async function signOut() {
+    try { await request('/auth/logout',{method:'POST'}) } catch { /* Expired sessions still return to the login screen. */ }
+    setAuthUser(null);setDashboard(null);setLoading(true);setNotice('');setError('');setAuthError('')
+  }
+
+  if (authLoading) return <div className="grid min-h-screen place-items-center bg-slate-50 text-sm text-slate-500">Checking your CircleCred session…</div>
+
+  if (!authUser && showRegistration) return <RegistrationScreen busy={loginBusy} error={authError} onCancel={()=>{setShowRegistration(false);setAuthError('')}} onComplete={user=>{setAuthUser(user);setAuthError('');setDashboard(null);setLoading(true)}}/>
+  if (!authUser) return <LoginScreen email={loginEmail} password={loginPassword} busy={loginBusy} error={authError} onEmail={setLoginEmail} onPassword={setLoginPassword} onSubmit={signIn} onRegister={()=>{setAuthError('');setShowRegistration(true)}}/>
+  if (authUser.role === 'circle_head') return <CircleHeadDashboard user={authUser} onLogout={() => void signOut()}/>
+  if (!loading && dashboard && dashboard.circles.length===0) return <MembershipOnboarding user={authUser} onLogout={()=>void signOut()} onCreated={async()=>{const result=await request<{user:AuthUser}>('/auth/me');setAuthUser(result.user);setDashboard(null);setLoading(true)}} onJoined={()=>void refresh()}/>
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 md:flex">
       <aside className="flex w-full shrink-0 flex-col bg-white p-5 md:min-h-screen md:w-64 md:border-r md:border-slate-200">
-        <div className="flex items-center gap-3">
-          <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-700 text-2xl font-bold text-white">
-            C
-          </div>
-          <div>
-            <h1 className="text-xl font-extrabold tracking-tight text-emerald-800">
-              CircleCred
-            </h1>
-            <p className="text-xs text-slate-500">Save together. Grow together.</p>
-          </div>
-        </div>
-
-        <p className="mb-3 mt-8 text-xs font-bold uppercase tracking-widest text-slate-400">
-          Workspace
-        </p>
-
-        <nav className="flex flex-wrap gap-2 md:flex-col">
-          {navItems.map(item => (
-            <button
-              key={item.label}
-              onClick={() => {
-                setSection(item.label)
-                setNotice('')
-              }}
-              className={`flex items-center gap-3 rounded-xl px-4 py-3 text-left text-sm font-semibold transition ${
-                section === item.label
-                  ? 'bg-emerald-50 text-emerald-800'
-                  : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'
-              }`}
-            >
-              <span className="text-xl">{item.icon}</span>
-              {item.label}
-            </button>
-          ))}
-        </nav>
-
-        <div className="mt-8 rounded-2xl bg-emerald-50 p-4 md:mt-auto">
-          <div className="mb-2 text-xl">🌱</div>
-          <h3 className="font-bold text-emerald-900">Small savings, big goals</h3>
-          <p className="mt-2 text-xs leading-5 text-emerald-800">
-            Consistent contributions help you build a record of your savings habits.
-          </p>
-        </div>
-
-        <div className="mt-5 flex items-center gap-3 border-t border-slate-100 pt-5">
-          <div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-100 font-bold text-amber-800">
-            AS
-          </div>
-          <div>
-            <p className="text-sm font-bold">Ananya Sharma</p>
-            <p className="text-xs text-slate-500">Circle member · Demo</p>
-          </div>
-        </div>
+        <div className="flex items-center gap-3"><div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-emerald-700 text-2xl font-bold text-white">C</div><div><h1 className="text-xl font-extrabold tracking-tight text-emerald-800">CircleCred</h1><p className="text-xs text-slate-500">Save together. Grow together.</p></div></div>
+        <p className="mb-3 mt-8 text-xs font-bold uppercase tracking-widest text-slate-400">Workspace</p>
+        <nav className="flex flex-wrap gap-2 md:flex-col">{navItems.map(item => <button key={item.label} onClick={() => { setSection(item.label); setNotice('') }} className={`flex items-center gap-3 rounded-xl px-4 py-3 text-left text-sm font-semibold transition ${section === item.label ? 'bg-emerald-50 text-emerald-800' : 'text-slate-500 hover:bg-slate-50 hover:text-slate-800'}`}><span className="text-xl">{item.icon}</span>{item.label}</button>)}</nav>
+        <div className="mt-8 rounded-2xl bg-emerald-50 p-4 md:mt-auto"><div className="mb-2 text-xl">🌱</div><h3 className="font-bold text-emerald-900">Small savings, big goals</h3><p className="mt-2 text-xs leading-5 text-emerald-800">Consistent contributions help you build a record of your savings habits.</p></div>
+        <div className="mt-5 flex items-center gap-3 border-t border-slate-100 pt-5"><div className="flex h-10 w-10 items-center justify-center rounded-full bg-amber-100 font-bold text-amber-800">{dashboard?.user.name.split(' ').map(n => n[0]).join('').slice(0, 2) || '—'}</div><div><p className="text-sm font-bold">{dashboard?.user.name || 'Loading member'}</p><p className="text-xs text-slate-500">Circle member · Demo</p></div></div>
       </aside>
-
       <main className="min-w-0 flex-1 p-5 sm:p-8 lg:p-10">
-        <header className="mb-8 flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <p className="text-sm font-medium text-slate-500">Monday, October 19, 2026</p>
-            <h2 className="mt-2 text-2xl font-extrabold tracking-tight sm:text-3xl">
-              {section === 'Overview' ? 'Your savings overview' : section}
-            </h2>
-            <p className="mt-2 text-sm text-slate-500">
-              Welcome back, Ananya. Keep building your savings journey.
-            </p>
-          </div>
-          <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600">
-            ◉ Demo account
-          </div>
-        </header>
-
-        {notice && (
-          <div role="status" className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-            <span>✓ {notice}</span>
-            <button onClick={() => setNotice('')} className="font-bold">Dismiss</button>
-          </div>
-        )}
-
-        {section === 'Overview' && (
-          <>
-            <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-              <StatCard title="Total Saved" value={money(saved)} icon="₹" detail="Recorded demo contributions" />
-              <StatCard title="Active Circles" value="2" icon="◉" detail="Community savings groups" />
-              <StatCard title="This Month" value={money(0)} icon="↗" detail="New contributions this month" />
-              <StatCard title="Reliability Score" value="750/850" icon="◇" detail="Illustrative internal score" />
-            </section>
-
-            <section className="mt-8 grid gap-6 xl:grid-cols-3">
-              <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm xl:col-span-2">
-                <div className="flex flex-wrap items-start justify-between gap-3">
-                  <div>
-                    <h3 className="text-lg font-bold">My Savings Circles</h3>
-                    <p className="mt-1 text-sm text-slate-500">Your groups and upcoming contributions</p>
-                  </div>
-                  <button onClick={() => setSection('My Circles')} className="text-sm font-bold text-emerald-700 hover:underline">
-                    View all →
-                  </button>
-                </div>
-
-                <div className="mt-5 space-y-4">
-                  {circles.map(circle => (
-                    <div key={circle.name} className="rounded-xl border border-slate-100 p-4">
-                      <div className="flex flex-wrap items-center gap-3">
-                        <div className={`flex h-12 w-12 items-center justify-center rounded-xl font-bold ${circle.color}`}>
-                          {circle.initials}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <h4 className="font-bold">{circle.name}</h4>
-                          <p className="mt-1 text-xs text-slate-500">
-                            {circle.members} members · {money(circle.contribution)} / month
-                          </p>
-                        </div>
-                        <span className="text-sm font-bold text-slate-700">{circle.progress}%</span>
-                      </div>
-                      <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-100">
-                        <div className="h-full rounded-full bg-emerald-600" style={{ width: `${circle.progress}%` }} />
-                      </div>
-                      <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
-                        <span>Next due: {circle.due}</span>
-                        <button onClick={() => recordContribution(circle.name, circle.contribution)} className="rounded-lg bg-emerald-700 px-3 py-2 font-semibold text-white hover:bg-emerald-800">
-                          Record demo payment
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-
-              <div className="rounded-2xl bg-emerald-800 p-6 text-white shadow-sm">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-medium text-emerald-100">Your Savings Reliability</p>
-                  <span className="text-2xl">◇</span>
-                </div>
-                <p className="mt-5 text-4xl font-extrabold">750<span className="text-lg font-medium text-emerald-200"> / 850</span></p>
-                <p className="mt-2 text-sm text-emerald-100">Illustrative demo score</p>
-                <div className="mt-5 h-2 rounded-full bg-emerald-950/40">
-                  <div className="h-full rounded-full bg-emerald-300" style={{ width: `${750 / 850 * 100}%` }} />
-                </div>
-                <p className="mt-5 text-sm leading-6 text-emerald-50">
-                  Your profile can summarize recorded contributions, consistency, and completed savings cycles.
-                </p>
-                <button onClick={() => setSection('Reliability')} className="mt-6 w-full rounded-xl bg-white px-4 py-3 text-sm font-bold text-emerald-900 hover:bg-emerald-50">
-                  Understand my score →
-                </button>
-                <p className="mt-4 text-xs leading-5 text-emerald-200">
-                  This is an internal demonstration indicator, not an official credit score or a loan guarantee.
-                </p>
-              </div>
-            </section>
-
-            <section className="mt-8 rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-              <div className="flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <h3 className="text-lg font-bold">Recent Contributions</h3>
-                  <p className="mt-1 text-sm text-slate-500">A transparent record of your savings activity</p>
-                </div>
-                <button onClick={() => setSection('Contributions')} className="text-sm font-bold text-emerald-700 hover:underline">
-                  See history →
-                </button>
-              </div>
-              <TransactionTable transactions={transactions.slice(0, 4)} />
-            </section>
-          </>
-        )}
-
-        {section === 'My Circles' && (
-          <section className="grid gap-5 lg:grid-cols-2">
-            {circles.map(circle => (
-              <div key={circle.name} className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-                <div className="flex items-center gap-4">
-                  <div className={`flex h-14 w-14 items-center justify-center rounded-2xl text-lg font-bold ${circle.color}`}>{circle.initials}</div>
-                  <div>
-                    <h3 className="text-lg font-bold">{circle.name}</h3>
-                    <p className="text-sm text-slate-500">{circle.members} members · Monthly circle</p>
-                  </div>
-                </div>
-                <div className="mt-6 grid grid-cols-2 gap-4">
-                  <div className="rounded-xl bg-slate-50 p-4">
-                    <p className="text-xs text-slate-500">Your contribution</p>
-                    <p className="mt-2 text-xl font-bold">{money(circle.contribution)}</p>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-4">
-                    <p className="text-xs text-slate-500">Potential monthly pool</p>
-                    <p className="mt-2 text-xl font-bold">{money(circle.contribution * circle.members)}</p>
-                  </div>
-                </div>
-                <div className="mt-5 flex justify-between text-sm">
-                  <span className="text-slate-500">Illustrative group progress</span>
-                  <strong>{circle.progress}%</strong>
-                </div>
-                <div className="mt-2 h-2 rounded-full bg-slate-100">
-                  <div className="h-2 rounded-full bg-emerald-600" style={{ width: `${circle.progress}%` }} />
-                </div>
-                <p className="mt-4 text-sm text-slate-500">Next due: {circle.due}</p>
-                <button onClick={() => recordContribution(circle.name, circle.contribution)} className="mt-5 w-full rounded-xl bg-emerald-700 px-4 py-3 font-semibold text-white hover:bg-emerald-800">
-                  Record demo contribution
-                </button>
-              </div>
-            ))}
-          </section>
-        )}
-
-        {section === 'Contributions' && (
-          <section className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h3 className="text-lg font-bold">Contribution History</h3>
-                <p className="mt-1 text-sm text-slate-500">Recorded activity for your demo account</p>
-              </div>
-              <span className="rounded-lg bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">
-                {transactions.length} records
-              </span>
-            </div>
-            <TransactionTable transactions={transactions} />
-            <p className="mt-4 text-xs leading-5 text-slate-500">
-              Demo data is stored only in the current app session. It is not a verified financial transaction history.
-            </p>
-          </section>
-        )}
-
-        {section === 'Reliability' && (
-          <section className="grid gap-6 lg:grid-cols-3">
-            <div className="rounded-2xl bg-emerald-800 p-7 text-white lg:col-span-1">
-              <p className="text-sm text-emerald-100">Illustrative Reliability Score</p>
-              <p className="mt-4 text-5xl font-extrabold">750<span className="text-xl text-emerald-200">/850</span></p>
-              <div className="mt-5 h-2 rounded-full bg-emerald-950/40">
-                <div className="h-full rounded-full bg-emerald-300" style={{ width: `${750 / 850 * 100}%` }} />
-              </div>
-              <p className="mt-5 text-sm leading-6 text-emerald-50">
-                This sample score is for demonstrating the interface. A real score must be calculated from verified contribution records and documented rules.
-              </p>
-            </div>
-            <div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm lg:col-span-2">
-              <h3 className="text-lg font-bold">What shapes your profile?</h3>
-              <p className="mt-1 text-sm text-slate-500">These are example indicators, not calculated results.</p>
-              <div className="mt-6 space-y-5">
-                <ScoreFactor title="On-time contributions" description="Whether recorded payments met their agreed deadlines." />
-                <ScoreFactor title="Savings consistency" description="How regularly contributions were made across cycles." />
-                <ScoreFactor title="Completed cycles" description="Participation in completed savings-circle cycles." />
-                <ScoreFactor title="Participation history" description="How long and how consistently you have participated." />
-              </div>
-              <button onClick={() => setShowProfile(!showProfile)} className="mt-7 rounded-xl border border-emerald-200 px-4 py-3 text-sm font-bold text-emerald-800 hover:bg-emerald-50">
-                {showProfile ? 'Hide profile notes' : 'View profile notes'}
-              </button>
-              {showProfile && (
-                <div className="mt-4 rounded-xl bg-slate-50 p-4 text-sm leading-6 text-slate-600">
-                  Your demo profile uses illustrative values. Production scoring requires reliable transaction verification, clear scoring rules, correction procedures, and appropriate consent before sharing any records.
-                </div>
-              )}
-            </div>
-          </section>
-        )}
-
-        <footer className="mt-10 border-t border-slate-200 py-5 text-center text-xs leading-5 text-slate-400">
-          CircleCred · Community savings, made transparent.
-          <br />
-          Prototype with simulated data. No real money is transferred.
-        </footer>
+        <header className="mb-8 flex flex-wrap items-center justify-between gap-4"><div><p className="text-sm font-medium text-slate-500">{dashboard ? dateLabel(dashboard.businessDate) : dateLabel(businessPeriod() + '-01')}</p><h2 className="mt-2 text-2xl font-extrabold tracking-tight sm:text-3xl">{section === 'Overview' ? 'Your savings overview' : section}</h2><p className="mt-2 text-sm text-slate-500">Welcome back{dashboard ? `, ${dashboard.user.name.split(' ')[0]}` : ''}. Keep building your savings journey.</p></div><div className="flex items-center gap-3"><div className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600">◉ Member account</div><button onClick={() => void signOut()} className="rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-600 hover:bg-slate-50">Sign out</button></div></header>
+        {notice && <div role="status" className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900"><span>✓ {notice}</span><button onClick={() => setNotice('')} className="font-bold">Dismiss</button></div>}
+        {error && <div role="alert" className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-800"><span>{error}</span><button onClick={() => void refresh()} className="font-bold underline">Retry connection</button></div>}
+        {loading && <p role="status" className="rounded-xl bg-white p-6 text-sm text-slate-500">Loading your savings data…</p>}
+        {!loading && dashboard && section === 'Overview' && <>
+          <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4"><StatCard title="Total Saved" value={money(totalSaved)} icon="₹" detail="Confirmed contributions"/><StatCard title="Active Circles" value={String(dashboard.circles.length)} icon="◉" detail="Community savings groups"/><StatCard title="This Month" value={money(thisMonth)} icon="↗" detail="Confirmed contributions this month"/><StatCard title="Reliability Score" value={score===null?'—':`${score}/850`} icon="◇" detail={score===null?'Shown after contribution records':'Internal savings indicator'}/></section>
+          <section className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-5"><DateMetric title="Upcoming" value={String(obligationSummary.upcoming ?? 0)}/><DateMetric title="Due today" value={String(obligationSummary.due_today ?? 0)}/><DateMetric title="Overdue installments" value={String(obligationSummary.overdue ?? 0)}/><DateMetric title="Partially paid" value={String(obligationSummary.partially_paid ?? 0)}/><DateMetric title="Outstanding balance" value={money(outstanding)}/></section>
+          <section className="mt-8 grid gap-6 xl:grid-cols-3"><div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm xl:col-span-2"><div className="flex flex-wrap items-start justify-between gap-3"><div><h3 className="text-lg font-bold">My Savings Circles</h3><p className="mt-1 text-sm text-slate-500">Your groups and upcoming contributions</p></div><button onClick={() => setSection('My Circles')} className="text-sm font-bold text-emerald-700 hover:underline">View all →</button></div><div className="mt-5 space-y-4">{dashboard.circles.map(circle => { const obligation=dashboard.obligations?.find(item => item.membership_id === circle.membership_id); return <CircleCard key={`${circle.id}-${obligation?.target_amount??0}-${obligation?.paid??0}`} circle={circle} obligation={obligation} status={getRoundStatus(circle,obligation,dashboard.contributions)} busy={busyCircle === circle.id} error={contributionErrors[circle.id]} onError={message=>setContributionErrors(current=>({...current,[circle.id]:message}))} onPay={amount => void recordContribution(circle, amount)}/> })}{!dashboard.circles.length&&<p className="rounded-xl bg-slate-50 p-5 text-sm leading-6 text-slate-600">You do not belong to a savings circle yet. Ask a Circle Head to invite you; your personal dashboard will show your round after activation.</p>}</div></div>
+            {score===null?<div className="rounded-2xl border border-slate-100 bg-white p-6 text-sm leading-6 text-slate-600">Your reliability indicator will appear after a circle round has contribution records.</div>:<ScoreCard score={score} onView={() => setSection('Reliability')}/>}</section>
+          <section className="mt-8 rounded-2xl border border-slate-100 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-bold">Recent Contributions</h3><p className="mt-1 text-sm text-slate-500">A transparent record of your savings activity</p></div><button onClick={() => setSection('Contributions')} className="text-sm font-bold text-emerald-700 hover:underline">See history →</button></div><TransactionTable transactions={dashboard.contributions.slice(0, 4)} statusLabel={statusLabel} onRetry={item=>void retryContribution(item)}/></section>
+        </>}
+        {!loading && dashboard && section === 'My Circles' && <section className="grid gap-5 lg:grid-cols-2">{dashboard.circles.map(circle => { const obligation=dashboard.obligations?.find(item => item.membership_id === circle.membership_id); return <div key={circle.id} className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm"><div className="mb-3"><h3 className="text-lg font-bold">{circle.name}</h3><p className="text-sm text-slate-500">{circle.members} members · {circle.frequency} circle</p></div><CircleCard key={`${circle.id}-${obligation?.target_amount??0}-${obligation?.paid??0}`} circle={circle} obligation={obligation} status={getRoundStatus(circle,obligation,dashboard.contributions)} busy={busyCircle === circle.id} error={contributionErrors[circle.id]} onError={message=>setContributionErrors(current=>({...current,[circle.id]:message}))} onPay={amount=>void recordContribution(circle,amount)}/><p className="mt-2 text-xs text-slate-500">{circle.paid_count} recorded installments</p></div> })}{!dashboard.circles.length&&<p className="rounded-xl bg-white p-6 text-sm leading-6 text-slate-600">No circles are linked to your account yet. Request an invitation from a Circle Head.</p>}</section>}
+        {!loading && dashboard && section === 'Contributions' && <section className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm"><div className="flex flex-wrap items-center justify-between gap-3"><div><h3 className="text-lg font-bold">Contribution History</h3><p className="mt-1 text-sm text-slate-500">Your personal contribution activity</p></div><span className="rounded-lg bg-emerald-50 px-3 py-2 text-sm font-bold text-emerald-800">{dashboard.contributions.length} records</span></div><TransactionTable transactions={dashboard.contributions} statusLabel={statusLabel} onRetry={item=>void retryContribution(item)}/><p className="mt-4 text-xs leading-5 text-slate-500">All payments shown here are simulated. No real money is transferred.</p></section>}
+        {!loading && dashboard && section === 'Reliability' && (score===null?<p className="rounded-xl bg-white p-6 text-sm leading-6 text-slate-600">No scoring records exist yet. Your reliability indicator will appear after you participate in a circle round.</p>:<section className="grid gap-6 lg:grid-cols-3"><div className="rounded-2xl bg-emerald-800 p-7 text-white lg:col-span-1"><p className="text-sm text-emerald-100">Savings Reliability Indicator</p><p className="mt-4 text-5xl font-extrabold">{score}<span className="text-xl text-emerald-200">/850</span></p><div className="mt-5 h-2 rounded-full bg-emerald-950/40"><div className="h-full rounded-full bg-emerald-300" style={{width:`${score/850*100}%`}}/></div><p className="mt-5 text-sm leading-6 text-emerald-50">Calculated from recorded contributions and circle participation.</p><p className="mt-4 text-xs leading-5 text-emerald-200">{Object.values(dashboard.scoreByMembership)[0]?.disclaimer}</p></div><div className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm lg:col-span-2"><h3 className="text-lg font-bold">What shapes your profile?</h3><p className="mt-1 text-sm text-slate-500">Calculated from your circle membership and contribution records.</p><div className="mt-6 space-y-5">{Object.values(dashboard.scoreByMembership)[0]?.factors.map(factor => <div key={factor.key} className="flex gap-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-50 font-bold text-emerald-700">{Math.round(factor.weight*100)}%</span><div className="min-w-0 flex-1"><div className="flex flex-wrap justify-between gap-2"><h4 className="font-semibold">{factor.label}</h4><strong>{factor.points} points</strong></div><p className="mt-1 text-sm leading-6 text-slate-500">{factor.detail}</p></div></div>)}</div><p className="mt-6 text-xs leading-5 text-slate-500">Weights: on-time payments 35%, consistency 25%, completed cycles 15%, delayed payments 15%, participation history 10%. The score is an internal savings indicator, not an official credit score or loan approval guarantee.</p></div></section>)}
+        <footer className="mt-10 border-t border-slate-200 py-5 text-center text-xs leading-5 text-slate-400">CircleCred · Community savings, made transparent.<br/>Prototype with simulated payments. No real money is transferred.</footer>
       </main>
     </div>
   )
 }
 
-function StatCard({ title, value, icon, detail }: {
-  title: string
-  value: string
-  icon: string
-  detail: string
-}) {
-  return (
-    <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm">
-      <div className="flex items-center justify-between">
-        <p className="text-sm font-medium text-slate-500">{title}</p>
-        <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-lg font-bold text-emerald-700">
-          {icon}
-        </span>
-      </div>
-      <p className="mt-4 text-2xl font-extrabold tracking-tight">{value}</p>
-      <p className="mt-2 text-xs leading-5 text-slate-500">{detail}</p>
-    </div>
-  )
+function StatCard({title,value,icon,detail}:{title:string;value:string;icon:string;detail:string}) { return <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm"><div className="flex items-center justify-between"><p className="text-sm font-medium text-slate-500">{title}</p><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-lg font-bold text-emerald-700">{icon}</span></div><p className="mt-4 text-2xl font-extrabold tracking-tight">{value}</p><p className="mt-2 text-xs leading-5 text-slate-500">{detail}</p></div> }
+function DateMetric({title,value}:{title:string;value:string}) { return <div className="rounded-xl border border-slate-100 bg-white p-4 shadow-sm"><p className="text-xs font-medium text-slate-500">{title}</p><p className="mt-2 text-lg font-extrabold">{value}</p></div> }
+function getRoundStatus(_circle:Circle,obligation:Obligation|undefined,_contributions:Contribution[]) { void _contributions;if(!obligation)return 'Not in this round';if(obligation.status==='paid')return 'Paid';const timing=obligation.timingStatus==='due_today'?'Due today':obligation.timingStatus==='overdue'?'Overdue':'Upcoming';return obligation.paid>0?`Partially paid · ${timing}`:timing }
+function CircleCard({circle,obligation,status,busy,error,onError,onPay}:{circle:Circle;obligation?:Obligation;status:string;busy:boolean;error?:string;onError:(message:string)=>void;onPay:(amount:string)=>void}) { const remaining=obligation?Math.max(0,obligation.target_amount-obligation.paid):0; const [amount,setAmount]=useState(String(remaining)); return <div className="rounded-xl border border-slate-100 p-4"><div className="flex flex-wrap items-center gap-3"><div className="flex h-12 w-12 items-center justify-center rounded-xl bg-emerald-100 font-bold text-emerald-700">{circle.name.split(/\s+/).map(w=>w[0]).join('').slice(0,2)}</div><div className="min-w-0 flex-1"><h4 className="font-bold">{circle.name}</h4><p className="mt-1 text-xs text-slate-500">{circle.members} members · target {money(obligation?.target_amount??circle.contribution_amount)} / month{obligation?` · due ${formatDate(obligation.deadline)}`:''}</p>{obligation?<p className="mt-1 text-xs text-slate-500">Confirmed {money(obligation.paid)} · Remaining {money(remaining)} · {status}</p>:<p className="mt-1 text-xs text-amber-700">{circle.status==='open'?'Open for Members · the Circle Head will freeze the roster before rounds begin':'Not included in this month’s locked round · eligible for a future round'}</p>}</div><span className="text-sm font-bold text-slate-700">{circle.paid_count} installments</span></div><div className="mt-4 flex flex-wrap items-center justify-end gap-3 text-xs text-slate-500"><label>Installment amount<input aria-label={`Installment amount for ${circle.name}`} disabled={!obligation||!remaining||busy} min="1" max={remaining} step="1" type="number" value={amount} onChange={e=>{setAmount(e.target.value);if(error)onError('')}} className="ml-2 w-32 rounded-lg border p-2 text-sm text-slate-800"/></label><button disabled={!obligation||busy||!remaining} onClick={()=>onPay(amount)} className="rounded-lg bg-emerald-700 px-3 py-2 font-semibold text-white hover:bg-emerald-800 disabled:opacity-60">{busy?'Processing…':obligation?remaining?'Record installment':'Target complete':'Not in round'}</button></div>{error&&<p role="alert" className="mt-3 text-sm text-rose-700">{error}</p>}</div> }
+function ScoreCard({score,onView}:{score:number;onView:()=>void}) { return <div className="rounded-2xl bg-emerald-800 p-6 text-white shadow-sm"><div className="flex items-center justify-between"><p className="text-sm font-medium text-emerald-100">Your Savings Reliability</p><span className="text-2xl">◇</span></div><p className="mt-5 text-4xl font-extrabold">{score}<span className="text-lg font-medium text-emerald-200"> / 850</span></p><p className="mt-2 text-sm text-emerald-100">Calculated from contribution and participation history</p><div className="mt-5 h-2 rounded-full bg-emerald-950/40"><div className="h-full rounded-full bg-emerald-300" style={{width:`${score/850*100}%`}}/></div><p className="mt-5 text-sm leading-6 text-emerald-50">Summarizes on-time contributions, consistency, cycle completion, delays, and participation.</p><button onClick={onView} className="mt-6 w-full rounded-xl bg-white px-4 py-3 text-sm font-bold text-emerald-900 hover:bg-emerald-50">Understand my score →</button><p className="mt-4 text-xs leading-5 text-emerald-200">Internal savings indicator only; not an official credit score or loan guarantee.</p></div> }
+function TransactionTable({transactions,statusLabel,onRetry}:{transactions:Contribution[];statusLabel:(status:Contribution['status'])=>string;onRetry?:(item:Contribution)=>void}) { if(!transactions.length)return <p className="py-8 text-center text-sm text-slate-500">No contributions recorded yet.</p>; return <div className="mt-5 overflow-x-auto"><table className="w-full min-w-[570px] text-left text-sm"><thead><tr className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-400"><th className="py-4 pr-4 font-semibold">Savings circle</th><th className="py-4 pr-4 font-semibold">Date</th><th className="py-4 pr-4 font-semibold">Amount</th><th className="py-4 font-semibold">Status</th>{onRetry&&<th className="py-4 font-semibold">Action</th>}</tr></thead><tbody>{transactions.map(item=><tr key={item.id} className="border-b border-slate-50 last:border-0"><td className="py-4 pr-4 font-semibold text-slate-700">{item.circle_name}</td><td className="py-4 pr-4 text-slate-500">{formatDate(item.paid_at || item.due_date)}</td><td className="py-4 pr-4 font-bold">{money(item.amount)}</td><td className="py-4"><span className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold ${item.status==='successful'?'bg-emerald-50 text-emerald-700':item.status==='failed'?'bg-rose-50 text-rose-700':'bg-amber-50 text-amber-800'}`}>{statusLabel(item.status)}</span></td>{onRetry&&<td className="py-4">{(item.status==='failed'||item.status==='pending')&&<button onClick={()=>onRetry(item)} className="font-semibold text-emerald-700 underline">{item.status==='failed'?'Retry':'Resume'}</button>}</td>}</tr>)}</tbody></table></div> }
+
+function LoginScreen({email,password,busy,error,onEmail,onPassword,onSubmit,onRegister}:{email:string;password:string;busy:boolean;error:string;onEmail:(value:string)=>void;onPassword:(value:string)=>void;onSubmit:(event:React.FormEvent)=>void;onRegister:()=>void}) {
+  return <main className="grid min-h-screen place-items-center bg-slate-50 p-5"><div className="w-full max-w-md rounded-3xl border border-slate-100 bg-white p-7 shadow-sm"><div className="mb-7 flex items-center gap-3"><div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-700 text-2xl font-bold text-white">C</div><div><h1 className="text-2xl font-extrabold text-emerald-800">CircleCred</h1><p className="text-sm text-slate-500">Sign in to your savings workspace</p></div></div><form onSubmit={onSubmit} className="space-y-4"><label className="block text-sm font-semibold text-slate-700">Email<input required type="email" value={email} onChange={event=>onEmail(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 p-3 font-normal" autoComplete="username"/></label><label className="block text-sm font-semibold text-slate-700">Password<input required type="password" value={password} onChange={event=>onPassword(event.target.value)} className="mt-1.5 w-full rounded-xl border border-slate-200 p-3 font-normal" autoComplete="current-password"/></label>{error&&<div role="alert" className="rounded-lg bg-rose-50 p-3 text-sm text-rose-800">{error}</div>}<button disabled={busy} className="w-full rounded-xl bg-emerald-700 p-3 font-bold text-white disabled:opacity-60">{busy?'Signing in…':'Sign in'}</button></form><button onClick={onRegister} className="mt-5 w-full rounded-xl border border-emerald-700 p-3 font-bold text-emerald-800">Create a free account</button><p className="mt-4 text-center text-xs leading-5 text-slate-500">Already have an activation key? Sign in or create an account, then enter the key to request membership.</p></div></main>
 }
 
-function TransactionTable({ transactions }: { transactions: Transaction[] }) {
-  if (transactions.length === 0) {
-    return <p className="py-8 text-center text-sm text-slate-500">No contributions recorded yet.</p>
-  }
-
-  return (
-    <div className="mt-5 overflow-x-auto">
-      <table className="w-full min-w-[570px] text-left text-sm">
-        <thead>
-          <tr className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-400">
-            <th className="py-4 pr-4 font-semibold">Savings circle</th>
-            <th className="py-4 pr-4 font-semibold">Date</th>
-            <th className="py-4 pr-4 font-semibold">Amount</th>
-            <th className="py-4 font-semibold">Status</th>
-          </tr>
-        </thead>
-        <tbody>
-          {transactions.map(transaction => (
-            <tr key={transaction.id} className="border-b border-slate-50 last:border-0">
-              <td className="py-4 pr-4 font-semibold text-slate-700">{transaction.circle}</td>
-              <td className="py-4 pr-4 text-slate-500">{transaction.date}</td>
-              <td className="py-4 pr-4 font-bold">{money(transaction.amount)}</td>
-              <td className="py-4">
-                <span className={`whitespace-nowrap rounded-full px-3 py-1 text-xs font-semibold ${
-                  transaction.status === 'Completed'
-                    ? 'bg-emerald-50 text-emerald-700'
-                    : 'bg-amber-50 text-amber-800'
-                }`}>
-                  {transaction.status}
-                </span>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
+function RegistrationScreen({busy,error,onCancel,onComplete}:{busy:boolean;error:string;onCancel:()=>void;onComplete:(user:AuthUser)=>void}) {
+  const [name,setName]=useState('');const [email,setEmail]=useState('');const [password,setPassword]=useState('');const [confirm,setConfirm]=useState('');const [localError,setLocalError]=useState('');const [submitting,setSubmitting]=useState(false)
+  async function submit(event:React.FormEvent){event.preventDefault();setLocalError('');if(name.trim().length<2||name.trim().length>100){setLocalError('Enter your name (2–100 characters).');return}if(password.length<12||password.length>128){setLocalError('Choose a private password with 12–128 characters.');return}if(password!==confirm){setLocalError('The passwords do not match.');return}setSubmitting(true);try{const result=await request<{user:AuthUser}>('/auth/register',{method:'POST',body:JSON.stringify({name,email,password})});onComplete(result.user)}catch(cause){setLocalError(cause instanceof Error?cause.message:'Registration failed.')}finally{setSubmitting(false)}}
+  return <main className="grid min-h-screen place-items-center bg-slate-50 p-5"><form onSubmit={submit} className="w-full max-w-lg space-y-4 rounded-3xl border border-slate-100 bg-white p-7 shadow-sm"><div><p className="text-xs font-bold uppercase tracking-widest text-emerald-700">Join CircleCred</p><h1 className="mt-1 text-2xl font-extrabold">Create your account</h1><p className="mt-2 text-sm text-slate-500">After registration, create a circle or join one with your invitation code.</p></div><label className="block text-sm font-semibold">Name<input required minLength={2} maxLength={100} value={name} onChange={e=>setName(e.target.value)} className="mt-1 w-full rounded-xl border p-3" autoComplete="name"/></label><label className="block text-sm font-semibold">Email<input required type="email" value={email} onChange={e=>setEmail(e.target.value)} className="mt-1 w-full rounded-xl border p-3" autoComplete="email"/></label><label className="block text-sm font-semibold">Password<input required minLength={12} maxLength={128} type="password" value={password} onChange={e=>setPassword(e.target.value)} className="mt-1 w-full rounded-xl border p-3" autoComplete="new-password"/></label><label className="block text-sm font-semibold">Confirm password<input required type="password" value={confirm} onChange={e=>setConfirm(e.target.value)} className="mt-1 w-full rounded-xl border p-3" autoComplete="new-password"/></label>{(localError||error)&&<p role="alert" className="rounded-lg bg-rose-50 p-3 text-sm text-rose-800">{localError||error}</p>}<button disabled={busy||submitting} className="w-full rounded-xl bg-emerald-700 p-3 font-bold text-white disabled:opacity-60">{submitting?'Creating account…':'Register'}</button><button type="button" onClick={onCancel} className="w-full p-2 text-sm font-semibold text-slate-600">Back to sign in</button></form></main>
 }
 
-function ScoreFactor({ title, description }: { title: string; description: string }) {
-  return (
-    <div className="flex gap-3">
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-50 font-bold text-emerald-700">✓</span>
-      <div>
-        <h4 className="font-semibold">{title}</h4>
-        <p className="mt-1 text-sm leading-6 text-slate-500">{description}</p>
-      </div>
-    </div>
-  )
+function MembershipOnboarding({user,onLogout,onCreated,onJoined}:{user:AuthUser;onLogout:()=>void;onCreated:()=>Promise<void>;onJoined:()=>void}) {
+  const [choice,setChoice]=useState<'create'|'join'|null>(null);const [membershipRequests,setMembershipRequests]=useState<{id:string;circle_name:string;status:string;requested_at:string}[]>([]);const [circleName,setCircleName]=useState('');const [target,setTarget]=useState('');const [dueDay,setDueDay]=useState('12');const [memberLimit,setMemberLimit]=useState('');const [invitationCode,setInvitationCode]=useState('');const [error,setError]=useState('');const [pendingNotice,setPendingNotice]=useState('');const [busy,setBusy]=useState(false)
+  useEffect(()=>{void request<{id:string;circle_name:string;status:string;requested_at:string}[]>('/membership-requests').then(setMembershipRequests).catch(()=>setMembershipRequests([]))},[])
+  async function createCircle(event:React.FormEvent){event.preventDefault();setError('');const contributionAmount=Number(target),deadlineDay=Number(dueDay),limit=memberLimit.trim()?Number(memberLimit):null;if(circleName.trim().length<2||circleName.trim().length>100||!Number.isSafeInteger(contributionAmount)||contributionAmount<=0||!Number.isInteger(deadlineDay)||deadlineDay<1||deadlineDay>28||(limit!==null&&(!Number.isSafeInteger(limit)||limit<1))){setError('Enter a circle name, positive whole-rupee target, and due day from 1 to 28.');return}setBusy(true);try{await request('/circles',{method:'POST',body:JSON.stringify({name:circleName.trim(),contributionAmount,dueDay:deadlineDay,frequency:'monthly',cycleCount:12,memberLimit:limit})});await onCreated()}catch(cause){setError(cause instanceof Error?cause.message:'Circle could not be created.')}finally{setBusy(false)}}
+  async function joinCircle(event:React.FormEvent){event.preventDefault();setError('');const token=invitationCode.trim();if(token.length<32){setError('Enter the activation key issued by your Circle Head.');return}setBusy(true);try{const result=await request<{message:string}>('/auth/invitations/redeem',{method:'POST',body:JSON.stringify({invitationCode:token})});setPendingNotice(result.message);setInvitationCode('');onJoined()}catch(cause){setError(cause instanceof Error?cause.message:'Circle invitation could not be used.')}finally{setBusy(false)}}
+  return <main className="min-h-screen bg-slate-50 p-5 text-slate-900 sm:p-10"><header className="mx-auto flex max-w-4xl items-center justify-between"><div><p className="text-xs font-bold uppercase tracking-widest text-emerald-700">CircleCred onboarding</p><h1 className="mt-1 text-2xl font-extrabold">Welcome, {user.name.split(' ')[0]}</h1></div><button onClick={onLogout} className="rounded-lg border bg-white px-4 py-2 text-sm font-semibold">Sign out</button></header><section className="mx-auto mt-8 max-w-4xl rounded-3xl border bg-white p-6 shadow-sm sm:p-8"><h2 className="text-xl font-bold">Choose how to get started</h2><p className="mt-2 text-sm leading-6 text-slate-600">Create a savings circle and become its Circle Head, or join a circle using a manually entered activation key issued to your registered email ({user.email}).</p><div className="mt-6 grid gap-4 sm:grid-cols-2"><button onClick={()=>{setChoice('create');setError('')}} className={`rounded-2xl border p-5 text-left ${choice==='create'?'border-emerald-700 bg-emerald-50':'hover:bg-slate-50'}`}><strong className="text-lg">Create a Circle</strong><p className="mt-2 text-sm text-slate-600">Set a contribution target and monthly due day. You’ll manage the circle.</p></button><button onClick={()=>{setChoice('join');setError('')}} className={`rounded-2xl border p-5 text-left ${choice==='join'?'border-emerald-700 bg-emerald-50':'hover:bg-slate-50'}`}><strong className="text-lg">Join a Circle</strong><p className="mt-2 text-sm text-slate-600">Enter the one-time activation key issued by the Circle Head. Your request needs Circle Head approval.</p></button></div>{error&&<p role="alert" className="mt-5 rounded-lg bg-rose-50 p-3 text-sm text-rose-800">{error}</p>}{pendingNotice&&<p role="status" className="mt-5 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-900"><strong>Pending Approval.</strong> {pendingNotice}</p>}{membershipRequests.length>0&&<div className="mt-5 rounded-xl border p-4"><h3 className="font-semibold">Your circle requests</h3>{membershipRequests.map(item=><p key={item.id} className="mt-2 text-sm"><strong>{item.circle_name}</strong> · <span className="capitalize">{item.status==='pending'?'Pending Approval':item.status}</span></p>)}</div>}{choice==='create'&&<form onSubmit={createCircle} className="mt-6 grid gap-4 border-t pt-6 sm:grid-cols-2"><label className="text-sm font-semibold">Circle name<input required minLength={2} maxLength={100} value={circleName} onChange={e=>setCircleName(e.target.value)} className="mt-1 w-full rounded-xl border p-3"/></label><label className="text-sm font-semibold">Monthly contribution target (₹)<input required min="1" step="1" type="number" value={target} onChange={e=>setTarget(e.target.value)} className="mt-1 w-full rounded-xl border p-3"/></label><label className="text-sm font-semibold">Monthly due day (1–28)<input required min="1" max="28" step="1" type="number" value={dueDay} onChange={e=>setDueDay(e.target.value)} className="mt-1 w-full rounded-xl border p-3"/></label><label className="text-sm font-semibold">Member limit (optional)<input min="1" step="1" type="number" value={memberLimit} onChange={e=>setMemberLimit(e.target.value)} className="mt-1 w-full rounded-xl border p-3"/></label><button disabled={busy} className="self-end rounded-xl bg-emerald-700 p-3 font-bold text-white disabled:opacity-60">{busy?'Creating…':'Create Circle'}</button></form>}{choice==='join'&&<form onSubmit={joinCircle} className="mt-6 grid gap-4 border-t pt-6 sm:grid-cols-[1fr_auto]"><label className="text-sm font-semibold">Activation key<input required value={invitationCode} onChange={e=>setInvitationCode(e.target.value)} className="mt-1 w-full rounded-xl border p-3" autoComplete="off"/></label><button disabled={busy} className="self-end rounded-xl bg-emerald-700 p-3 font-bold text-white disabled:opacity-60">{busy?'Joining…':'Join Circle'}</button><p className="text-xs leading-5 text-slate-500 sm:col-span-2">The activation key is single-use, expires after seven days, and must match your registered email. Submitting a key does not guarantee admission; the Circle Head must approve your request.</p></form>}</section></main>
 }
 
 export default App
