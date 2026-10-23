@@ -6,6 +6,9 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
+    "test": "npm run build && node --test test/*.test.cjs",
+    "db:reset": "npm run build && node dist/scripts/resetDatabase.js",
+    "seed:demo": "npm run build && node dist/scripts/seedDemo.js --confirm-demo-seed",
     "start": "node dist/server.js"
   },
   "dependencies": {
